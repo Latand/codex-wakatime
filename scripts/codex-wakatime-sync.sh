@@ -3,7 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-SYNC_SCRIPT="${SCRIPT_PATH:-${SCRIPT_DIR}/../codex_wakatime_sync.py}"
+
+DEFAULT_SYNC_SCRIPT="${SCRIPT_DIR}/codex_wakatime_sync.py"
+if [[ ! -f "${DEFAULT_SYNC_SCRIPT}" ]]; then
+  DEFAULT_SYNC_SCRIPT="${SCRIPT_DIR}/../codex_wakatime_sync.py"
+fi
+SYNC_SCRIPT="${SCRIPT_PATH:-${DEFAULT_SYNC_SCRIPT}}"
 SESSIONS_DIR="${SESSIONS_DIR:-$HOME/.codex/sessions}"
 STATE_DB="${STATE_DB:-$HOME/.codex-wakatime/state.db}"
 WAKATIME_BIN="${WAKATIME_BIN:-wakatime-cli}"
