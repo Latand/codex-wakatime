@@ -1,6 +1,6 @@
 # Codex → WakaTime Sync
 
-Drop-in script for converting OpenAI Codex/Claude Code shell sessions into WakaTime heartbeats labeled as AI coding.
+Drop-in script for converting OpenAI Codex Code shell sessions into WakaTime heartbeats labeled as AI coding.
 
 ## Install
 
@@ -20,7 +20,7 @@ chmod +x ~/.local/share/codex-wakatime/codex_wakatime_sync.py \
 
 - Python 3.10+
 - `wakatime-cli` installed and configured with your API key in `~/.wakatime.cfg`
-- Codex or Claude logs at `~/.codex/sessions/` (default Codex CLI location)
+- Codex logs at `~/.codex/sessions/` (default Codex CLI location)
 
 ## Manual Sync
 
