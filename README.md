@@ -20,7 +20,7 @@ chmod +x ~/.local/share/codex-wakatime/codex_wakatime_sync.py \
 
 - Python 3.10+
 - `wakatime-cli` installed and configured with your API key in `~/.wakatime.cfg`
-- Codex logs at `~/.codex/sessions/` (default Codex CLI location)
+<<<<<<< HEAD
 
 ## Manual Sync
 
