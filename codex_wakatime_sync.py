@@ -298,15 +298,16 @@ def normalize_to_heartbeats(
             logger.warning(f"Failed to parse arguments for {call_id}")
             continue
 
-        command_list = args.get('command', [])
-        if not command_list:
+        command_list = args.get('command')
+        if not isinstance(command_list, list) or not command_list:
             continue
 
         workdir = args.get('workdir')
 
         # Build entity (command truncated to 200 chars)
         command_str = ' '.join(command_list)
-        entity = command_str[:200]
+        primary_cmd = command_list[0] if command_list else 'shell'
+        entity = f"codex-shell:{primary_cmd}"[:200]
 
         # Determine project
         ctx = session_contexts.get(str(session_path), SessionContext())
@@ -330,9 +331,11 @@ def normalize_to_heartbeats(
 
         # Build metadata
         metadata = {
-            'command': command_list,
             'workdir': workdir or ctx.cwd,
         }
+        if command_list:
+            metadata['command_hash'] = hashlib.sha256(command_str.encode('utf-8')).hexdigest()
+            metadata['command_tokens'] = len(command_list)
         if ctx.git_branch:
             metadata['branch'] = ctx.git_branch
 

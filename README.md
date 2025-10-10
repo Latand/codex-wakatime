@@ -8,10 +8,13 @@ Drop-in script for converting OpenAI Codex/Claude Code shell sessions into WakaT
 mkdir -p ~/.local/share/codex-wakatime
 curl -L https://raw.githubusercontent.com/latand/codex-wakatime/main/codex_wakatime_sync.py \
   -o ~/.local/share/codex-wakatime/codex_wakatime_sync.py
-chmod +x ~/.local/share/codex-wakatime/codex_wakatime_sync.py
+curl -L https://raw.githubusercontent.com/latand/codex-wakatime/main/scripts/codex-wakatime-sync.sh \
+  -o ~/.local/share/codex-wakatime/codex-wakatime-sync.sh
+chmod +x ~/.local/share/codex-wakatime/codex_wakatime_sync.py \
+          ~/.local/share/codex-wakatime/codex-wakatime-sync.sh
 ```
 
-(Replace the `curl` URL with your own fork while iterating locally.)
+(Replace the `curl` URLs with your own fork while iterating locally.)
 
 ## Requirements
 
@@ -35,14 +38,15 @@ Useful flags:
 
 ```
 */15 * * * * PATH=$PATH:$HOME/.local/bin \
-  python ~/.local/share/codex-wakatime/codex_wakatime_sync.py sync --since 45m \
+  $HOME/.local/share/codex-wakatime/codex-wakatime-sync.sh 45m --log-level WARNING \
   >> $HOME/.codex-wakatime/cron.log 2>&1
 ```
 
-To flush any queued heartbeats after each run add `wakatime-cli --sync-offline-activity 0`.
+The shell wrapper runs the Python sync and immediately flushes `wakatime-cli --sync-offline-activity 0` to push queued heartbeats.
 
 ## Notes
 
+- Command contents are never sent to WakaTime; the script stores only a SHA-256 hash and token count for troubleshooting.
 - Heartbeats are tagged as `ai coding` so they surface under WakaTime's AI category.
 - Deduplication happens via `~/.codex-wakatime/state.db`; delete rows to backfill past sessions.
 
