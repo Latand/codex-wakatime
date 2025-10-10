@@ -226,7 +226,7 @@ def parse_codex_logs(
                         event_time = base_time + datetime.timedelta(seconds=fallback_offset)
                         fallback_offset += 1
 
-                    if event_time < since:
+                    if event_time < since and event.get('type') != 'session_meta':
                         continue
 
                     events.append((event, session_file, event_time))
