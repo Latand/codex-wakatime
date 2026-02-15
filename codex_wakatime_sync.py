@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -285,8 +286,8 @@ def normalize_to_heartbeats(
         else:
             continue
 
-        # Skip non-shell calls (allow shell, bash, ignore update_plan gracefully)
-        if func_name not in ('shell', 'bash', 'Bash'):
+        # Skip non-command calls (allow legacy/new command tool names).
+        if func_name not in ('shell', 'bash', 'Bash', 'shell_command', 'exec_command'):
             if func_name == 'update_plan':
                 continue  # Skip gracefully
             continue
@@ -298,14 +299,34 @@ def normalize_to_heartbeats(
             logger.warning(f"Failed to parse arguments for {call_id}")
             continue
 
-        command_list = args.get('command')
-        if not isinstance(command_list, list) or not command_list:
+        command_list: List[str] = []
+        command_str = ''
+
+        raw_command = args.get('command')
+        if isinstance(raw_command, list):
+            command_list = [str(part) for part in raw_command if part is not None]
+            command_str = ' '.join(command_list).strip()
+        elif isinstance(raw_command, str):
+            command_str = raw_command.strip()
+            if command_str:
+                try:
+                    command_list = shlex.split(command_str)
+                except ValueError:
+                    command_list = command_str.split()
+        elif isinstance(args.get('cmd'), str):
+            command_str = args['cmd'].strip()
+            if command_str:
+                try:
+                    command_list = shlex.split(command_str)
+                except ValueError:
+                    command_list = command_str.split()
+
+        if not command_list or not command_str:
             continue
 
         workdir = args.get('workdir')
 
         # Build entity (command truncated to 200 chars)
-        command_str = ' '.join(command_list)
         primary_cmd = command_list[0] if command_list else 'shell'
         entity = f"codex-shell:{primary_cmd}"[:200]
 
