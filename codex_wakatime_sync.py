@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""
-Codex→WakaTime Bridge: sync Codex shell activity to WakaTime heartbeats.
+"""Privacy-preserving Codex and Claude activity sync for WakaTime."""
 
-Parses Codex rollout logs from sessions directory and sends coding activity
-to WakaTime via CLI or API mode with deduplication and retry logic.
-"""
+from __future__ import annotations
 
 import argparse
 import base64
+import configparser
 import dataclasses
 import datetime
+import glob
 import hashlib
-import itertools
+import hmac
 import json
 import logging
 import os
-import re
-import shlex
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -24,717 +22,946 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional, Sequence
 
 
-# ============================================================================
-# Data Structures
-# ============================================================================
+VERSION = "1.0.0"
+PLUGIN = f"agent-wakatime/{VERSION}"
+SUPPORTED_ENGINES = {"claude", "codex"}
+DEFAULT_SOURCE_FILE = Path.home() / ".config" / "agent-wakatime" / "sources.conf"
+DEFAULT_STATE_DB = Path.home() / ".codex-wakatime" / "state.db"
+DEFAULT_PRIVACY_KEY = Path.home() / ".codex-wakatime" / "privacy.key"
+DEFAULT_WAKATIME_CONFIG = Path.home() / ".wakatime.cfg"
 
 
-@dataclasses.dataclass
-class SessionContext:
-    """Maintains session state from session_meta events."""
-    cwd: Optional[str] = None
-    git_branch: Optional[str] = None
+@dataclasses.dataclass(frozen=True)
+class Source:
+    """A transcript directory assigned to an engine adapter."""
+
+    engine: str
+    directory: Path
+
+    def __post_init__(self) -> None:
+        if self.engine not in SUPPORTED_ENGINES:
+            raise ValueError("unsupported source engine")
 
 
-@dataclasses.dataclass
-class Heartbeat:
-    """Normalized heartbeat ready to send to WakaTime."""
-    call_id: str
-    timestamp: float  # epoch seconds
-    entity: str  # command truncated to 200 chars
-    entity_type: str  # always 'app'
-    category: str  # e.g., 'ai coding'
+@dataclasses.dataclass(frozen=True)
+class ActivityInterval:
+    engine: str
+    session_key: str
+    turn_key: str
+    start: float
+    end: float
+    project_key: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ActivityHeartbeat:
+    fingerprint: str
+    timestamp: float
+    engine: str
     project: str
-    session_path: str
-    metadata: Dict[str, Any]  # extra context (workdir, command, branch)
+    session_key: str
 
 
 @dataclasses.dataclass
-class Stats:
-    """Tracks processing statistics."""
-    scanned: int = 0
-    eligible: int = 0
+class CollectionStats:
+    files: int = 0
+    inaccessible_files: int = 0
+    malformed_lines: int = 0
+    intervals: int = 0
+    duplicate_intervals: int = 0
+
+
+@dataclasses.dataclass
+class SyncStats:
+    files: int = 0
+    intervals: int = 0
+    generated: int = 0
     duplicates: int = 0
     sent: int = 0
     failed: int = 0
+    malformed_lines: int = 0
+    inaccessible_files: int = 0
 
 
-# ============================================================================
-# Time Parsing
-# ============================================================================
+@dataclasses.dataclass
+class ParseResult:
+    intervals: list[ActivityInterval] = dataclasses.field(default_factory=list)
+    malformed_lines: int = 0
+    inaccessible: bool = False
 
 
-def parse_since(since: str) -> datetime.datetime:
-    """Parse --since argument to datetime (UTC).
-
-    Supports:
-    - Relative: 15m, 2h, 1d
-    - ISO date: 2025-10-10
-    - ISO datetime: 2025-10-10T14:51:40Z or 2025-10-10T14:51:40
-    """
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    # Try relative formats first
-    if since.endswith('m'):
-        minutes = int(since[:-1])
-        return now - datetime.timedelta(minutes=minutes)
-    elif since.endswith('h'):
-        hours = int(since[:-1])
-        return now - datetime.timedelta(hours=hours)
-    elif since.endswith('d'):
-        days = int(since[:-1])
-        return now - datetime.timedelta(days=days)
-
-    # Try ISO formats
-    try:
-        # ISO datetime with Z
-        if since.endswith('Z'):
-            return datetime.datetime.fromisoformat(since[:-1]).replace(tzinfo=datetime.timezone.utc)
-        # ISO datetime without timezone (assume UTC)
-        elif 'T' in since:
-            return datetime.datetime.fromisoformat(since).replace(tzinfo=datetime.timezone.utc)
-        # ISO date only
-        else:
-            return datetime.datetime.fromisoformat(since).replace(tzinfo=datetime.timezone.utc)
-    except ValueError:
-        raise ValueError(f"Invalid --since format: {since}. Use 15m, 2h, 1d, ISO date, or ISO datetime")
+def _private_hash(value: str, privacy_key: bytes, length: int = 16) -> str:
+    digest = hmac.new(privacy_key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+    return digest[:length]
 
 
-# ============================================================================
-# State Database
-# ============================================================================
-
-
-class StateDB:
-    """SQLite database for tracking sent events."""
-
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path))
-        self._init_schema()
-
-    def _init_schema(self):
-        """Create sent_events table if not exists."""
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS sent_events (
-                call_id TEXT PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                session_path TEXT NOT NULL,
-                sent_at TEXT NOT NULL,
-                mode TEXT NOT NULL
-            )
-        """)
-        self.conn.commit()
-
-    def is_sent(self, call_id: str) -> bool:
-        """Check if call_id was already sent."""
-        cursor = self.conn.execute(
-            "SELECT 1 FROM sent_events WHERE call_id = ? LIMIT 1",
-            (call_id,)
-        )
-        return cursor.fetchone() is not None
-
-    def mark_sent(self, heartbeat: Heartbeat, mode: str):
-        """Mark heartbeat as sent."""
-        self.conn.execute(
-            """
-            INSERT INTO sent_events (call_id, timestamp, session_path, sent_at, mode)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                heartbeat.call_id,
-                datetime.datetime.fromtimestamp(heartbeat.timestamp, datetime.timezone.utc).isoformat(),
-                heartbeat.session_path,
-                datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                mode
-            )
-        )
-        self.conn.commit()
-
-    def close(self):
-        """Close database connection."""
-        self.conn.close()
-
-
-# ============================================================================
-# Codex Log Parser
-# ============================================================================
-
-
-def _parse_iso_timestamp(value: str) -> Optional[datetime.datetime]:
-    """Parse ISO8601 value, accepting trailing Z."""
-    if not value:
+def _parse_iso_timestamp(value: Any) -> Optional[datetime.datetime]:
+    if isinstance(value, (int, float)):
+        return datetime.datetime.fromtimestamp(float(value), datetime.timezone.utc)
+    if not isinstance(value, str) or not value:
         return None
     try:
-        if value.endswith('Z'):
-            return datetime.datetime.fromisoformat(value[:-1]).replace(tzinfo=datetime.timezone.utc)
-        return datetime.datetime.fromisoformat(value).replace(tzinfo=datetime.timezone.utc)
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
 
 
-def _session_file_start(session_file: Path) -> datetime.datetime:
-    """Approximate session start from filename or file mtime."""
-    match = re.search(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})", session_file.name)
-    if match:
-        iso_prefix = match.group(1)
-        mins = match.group(2)
-        secs = match.group(3)
-        iso_value = f"{iso_prefix}:{mins}:{secs}"
-        parsed = _parse_iso_timestamp(iso_value)
-        if parsed:
-            return parsed
-    return datetime.datetime.fromtimestamp(session_file.stat().st_mtime, datetime.timezone.utc)
-
-
-def parse_codex_logs(
-    sessions_dir: Path,
-    since: datetime.datetime,
-    max_events: Optional[int],
-    logger: logging.Logger
-) -> List[Tuple[Dict[str, Any], Path, datetime.datetime]]:
-    """Scan and parse Codex rollout logs.
-
-    Returns list of (event_dict, session_path, event_time) tuples for events >= since.
-    """
-    events: List[Tuple[Dict[str, Any], Path, datetime.datetime]] = []
-    session_files = sorted(sessions_dir.rglob("rollout-*.jsonl"))
-
-    for session_file in session_files:
+def parse_since(value: str, now: Optional[datetime.datetime] = None) -> datetime.datetime:
+    """Parse a relative duration or an ISO-8601 timestamp as UTC."""
+    current = now or datetime.datetime.now(datetime.timezone.utc)
+    units = {"m": 60, "h": 3600, "d": 86400}
+    if len(value) > 1 and value[-1] in units:
         try:
-            base_time = _session_file_start(session_file)
-            fallback_offset = 0
-
-            with open(session_file, 'r', encoding='utf-8') as handle:
-                for line_num, line in enumerate(handle, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        logger.warning(f"JSON decode error in {session_file}:{line_num}: {exc}")
-                        continue
-
-                    raw_ts = event.get('timestamp') or event.get('time')
-                    event_time = _parse_iso_timestamp(raw_ts)
-                    if event_time is None:
-                        event_time = base_time + datetime.timedelta(seconds=fallback_offset)
-                        fallback_offset += 1
-
-                    if event_time < since and event.get('type') != 'session_meta':
-                        continue
-
-                    events.append((event, session_file, event_time))
-
-                    if max_events and len(events) >= max_events:
-                        logger.info(f"Reached max_events limit ({max_events})")
-                        return sorted(events, key=lambda item: item[2])
-
-        except Exception as exc:
-            logger.warning(f"Error reading {session_file}: {exc}")
-            continue
-
-    events.sort(key=lambda item: item[2])
-    return events
+            amount = int(value[:-1])
+        except ValueError as exc:
+            raise ValueError("invalid relative time") from exc
+        if amount <= 0:
+            raise ValueError("relative time must be positive")
+        return current - datetime.timedelta(seconds=amount * units[value[-1]])
+    parsed = _parse_iso_timestamp(value)
+    if parsed is None:
+        raise ValueError("invalid time; use 45m, 2h, 1d, or ISO-8601")
+    return parsed
 
 
-def normalize_to_heartbeats(
-    events: List[Tuple[Dict[str, Any], Path, datetime.datetime]],
-    project_override: Optional[str],
-    logger: logging.Logger
-) -> List[Heartbeat]:
-    """Convert parsed events to normalized Heartbeat objects.
+def parse_duration(value: str) -> int:
+    units = {"s": 1, "m": 60, "h": 3600}
+    if len(value) < 2 or value[-1] not in units:
+        raise ValueError("invalid duration; use 30s, 15m, or 1h")
+    try:
+        amount = int(value[:-1])
+    except ValueError as exc:
+        raise ValueError("invalid duration") from exc
+    if amount <= 0:
+        raise ValueError("duration must be positive")
+    return amount * units[value[-1]]
 
-    Handles both modern (response_item) and legacy (type=function_call) formats.
-    Maintains session context from session_meta events.
-    """
-    heartbeats = []
-    session_contexts: Dict[str, SessionContext] = {}
 
-    for event, session_path, event_time in events:
-        # Update session context from session_meta
-        if event.get('type') == 'session_meta':
-            payload = event.get('payload', {})
-            ctx = session_contexts.setdefault(str(session_path), SessionContext())
-            ctx.cwd = payload.get('cwd') or ctx.cwd
-            git_payload = payload.get('git') or {}
-            ctx.git_branch = git_payload.get('branch') or ctx.git_branch
-            continue
+_PROJECT_SEED_CACHE: dict[str, str] = {}
 
-        # Modern format: response_item with payload.type == function_call
-        if event.get('type') == 'response_item':
-            payload = event.get('payload', {})
-            if payload.get('type') != 'function_call':
+
+def _run_git(path: Path, args: Sequence[str]) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _project_seed(path_value: Any, repository_hint: Any = None) -> str:
+    if isinstance(repository_hint, str) and repository_hint:
+        return f"repository:{repository_hint}"
+    if not isinstance(path_value, str) or not path_value:
+        return "unknown-project"
+    cached = _PROJECT_SEED_CACHE.get(path_value)
+    if cached:
+        return cached
+
+    original = Path(path_value).expanduser()
+    candidate = original
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    if candidate.exists():
+        top = _run_git(candidate, ["rev-parse", "--show-toplevel"])
+        remote = _run_git(candidate, ["config", "--get", "remote.origin.url"])
+        if remote:
+            seed = f"repository:{remote}"
+        elif top:
+            seed = f"repository-root:{top}"
+        else:
+            seed = f"workspace:{original}"
+    else:
+        seed = f"workspace:{original}"
+    _PROJECT_SEED_CACHE[path_value] = seed
+    return seed
+
+
+def _make_interval(
+    engine: str,
+    session_id: str,
+    turn_id: str,
+    start: float,
+    end: float,
+    project_seed: str,
+    privacy_key: bytes,
+) -> ActivityInterval:
+    return ActivityInterval(
+        engine=engine,
+        session_key=_private_hash(f"session:{engine}:{session_id}", privacy_key),
+        turn_key=_private_hash(f"turn:{engine}:{turn_id}", privacy_key),
+        start=start,
+        end=end,
+        project_key=_private_hash(f"project:{project_seed}", privacy_key, 12),
+    )
+
+
+def _codex_intervals(
+    session_file: Path,
+    since: float,
+    now: float,
+    active_grace_seconds: int,
+    privacy_key: bytes,
+) -> ParseResult:
+    result = ParseResult()
+    session_id = session_file.stem
+    project_seed = "unknown-project"
+    starts: dict[str, tuple[float, str]] = {}
+    latest_event = 0.0
+
+    try:
+        handle = session_file.open("r", encoding="utf-8")
+    except OSError:
+        result.inaccessible = True
+        return result
+
+    with handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                result.malformed_lines += 1
+                continue
+            if not isinstance(event, dict):
                 continue
 
-            func_name = payload.get('name', '')
-            call_id = payload.get('call_id', '')
-            args_json = payload.get('arguments', '{}')
+            event_time = _parse_iso_timestamp(event.get("timestamp") or event.get("time"))
+            timestamp = event_time.timestamp() if event_time else None
+            if timestamp is not None:
+                latest_event = max(latest_event, timestamp)
 
-        # Legacy format: type == function_call
-        elif event.get('type') == 'function_call':
-            func_name = event.get('name', '')
-            call_id = event.get('call_id', '')
-            args_json = event.get('arguments', '{}')
+            if event.get("type") == "session_meta":
+                payload = event.get("payload") or {}
+                if isinstance(payload, dict):
+                    session_id = str(payload.get("id") or payload.get("session_id") or session_id)
+                    git_data = payload.get("git") or {}
+                    repository_hint = git_data.get("repository_url") if isinstance(git_data, dict) else None
+                    project_seed = _project_seed(payload.get("cwd"), repository_hint)
+                continue
+            if timestamp is None:
+                continue
 
-        else:
-            continue
+            payload = event.get("payload") or {}
+            if not isinstance(payload, dict) or event.get("type") != "event_msg":
+                continue
+            event_kind = payload.get("type")
+            turn_id = str(payload.get("turn_id") or "")
+            if event_kind == "task_started" and turn_id:
+                for previous_turn, (previous_start, previous_project) in starts.items():
+                    if timestamp >= since and timestamp >= previous_start:
+                        result.intervals.append(
+                            _make_interval(
+                                "codex",
+                                session_id,
+                                previous_turn,
+                                previous_start,
+                                timestamp,
+                                previous_project,
+                                privacy_key,
+                            )
+                        )
+                starts.clear()
+                starts[turn_id] = (timestamp, project_seed)
+            elif event_kind in {"task_complete", "turn_aborted"} and turn_id in starts:
+                start, turn_project = starts.pop(turn_id)
+                if timestamp >= since and timestamp >= start:
+                    result.intervals.append(
+                        _make_interval(
+                            "codex",
+                            session_id,
+                            turn_id,
+                            start,
+                            timestamp,
+                            turn_project,
+                            privacy_key,
+                        )
+                    )
 
-        # Skip non-command calls (allow legacy/new command tool names).
-        if func_name not in ('shell', 'bash', 'Bash', 'shell_command', 'exec_command'):
-            if func_name == 'update_plan':
-                continue  # Skip gracefully
-            continue
-
-        # Parse arguments
-        try:
-            args = json.loads(args_json)
-        except json.JSONDecodeError:
-            logger.warning(f"Failed to parse arguments for {call_id}")
-            continue
-
-        command_list: List[str] = []
-        command_str = ''
-
-        raw_command = args.get('command')
-        if isinstance(raw_command, list):
-            command_list = [str(part) for part in raw_command if part is not None]
-            command_str = ' '.join(command_list).strip()
-        elif isinstance(raw_command, str):
-            command_str = raw_command.strip()
-            if command_str:
-                try:
-                    command_list = shlex.split(command_str)
-                except ValueError:
-                    command_list = command_str.split()
-        elif isinstance(args.get('cmd'), str):
-            command_str = args['cmd'].strip()
-            if command_str:
-                try:
-                    command_list = shlex.split(command_str)
-                except ValueError:
-                    command_list = command_str.split()
-
-        if not command_list or not command_str:
-            continue
-
-        workdir = args.get('workdir')
-
-        # Build entity (command truncated to 200 chars)
-        primary_cmd = command_list[0] if command_list else 'shell'
-        entity = f"codex-shell:{primary_cmd}"[:200]
-
-        # Determine project
-        ctx = session_contexts.get(str(session_path), SessionContext())
-        project_candidates = []
-        if project_override:
-            project_candidates.append(project_override)
-        if workdir:
-            project_candidates.append(Path(workdir).name)
-        if ctx.cwd:
-            project_candidates.append(Path(ctx.cwd).name)
-        project_candidates.append(session_path.parent.name)
-
-        project = next(
-            (
-                candidate
-                for candidate in project_candidates
-                if candidate and candidate not in ('.', os.sep)
-            ),
-            'codex'
-        )
-
-        # Build metadata
-        metadata = {
-            'workdir': workdir or ctx.cwd,
-        }
-        if command_list:
-            metadata['command_hash'] = hashlib.sha256(command_str.encode('utf-8')).hexdigest()
-            metadata['command_tokens'] = len(command_list)
-        if ctx.git_branch:
-            metadata['branch'] = ctx.git_branch
-
-        heartbeats.append(Heartbeat(
-            call_id=call_id,
-            timestamp=event_time.timestamp(),
-            entity=entity,
-            entity_type='app',
-            category='ai coding',
-            project=project,
-            session_path=str(session_path),
-            metadata=metadata
-        ))
-
-    return heartbeats
-
-
-# ============================================================================
-# Senders
-# ============================================================================
-
-
-def send_cli_mode(
-    heartbeat: Heartbeat,
-    wakatime_bin: str,
-    dry_run: bool,
-    logger: logging.Logger
-) -> bool:
-    """Send heartbeat via wakatime-cli.
-
-    Returns True on success, False on failure.
-    Retries once on failure after 2s delay.
-    """
-    if dry_run:
-        logger.info(f"[DRY-RUN] Would send via CLI: {heartbeat.entity} @ {heartbeat.timestamp}")
-        return True
-
-    cmd = [
-        wakatime_bin,
-        '--entity', heartbeat.entity,
-        '--entity-type', 'app',
-        '--category', heartbeat.category,
-        '--time', str(heartbeat.timestamp),
-        '--project', heartbeat.project,
-        '--plugin', 'codex-bridge/0.1',
-        '--write'
-    ]
-
-    for attempt in range(2):
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                logger.debug(f"CLI sent: {heartbeat.call_id}")
-                return True
-            else:
-                logger.warning(
-                    f"CLI failed (attempt {attempt + 1}/2) for {heartbeat.call_id}: "
-                    f"exit={result.returncode}, stderr={result.stderr[:200]}"
+    if starts and latest_event:
+        open_end = min(now, latest_event + active_grace_seconds)
+        for turn_id, (start, turn_project) in starts.items():
+            if open_end >= since and open_end >= start:
+                result.intervals.append(
+                    _make_interval(
+                        "codex",
+                        session_id,
+                        turn_id,
+                        start,
+                        open_end,
+                        turn_project,
+                        privacy_key,
+                    )
                 )
-                if attempt == 0:
-                    time.sleep(2)
+    return result
 
-        except subprocess.TimeoutExpired:
-            logger.warning(f"CLI timeout (attempt {attempt + 1}/2) for {heartbeat.call_id}")
-            if attempt == 0:
-                time.sleep(2)
-        except Exception as e:
-            logger.warning(f"CLI error (attempt {attempt + 1}/2) for {heartbeat.call_id}: {e}")
-            if attempt == 0:
-                time.sleep(2)
 
+def _is_claude_prompt(event: dict[str, Any]) -> bool:
+    if event.get("type") != "user" or event.get("isMeta") is True:
+        return False
+    if event.get("toolUseResult") is not None or event.get("sourceToolAssistantUUID") is not None:
+        return False
+    if event.get("isCompactSummary") is True or event.get("isVisibleInTranscriptOnly") is True:
+        return False
+    content = (event.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return any(
+            isinstance(item, dict) and item.get("type") in {"text", "image"}
+            for item in content
+        )
     return False
 
 
-def send_api_mode_batch(
-    heartbeats: List[Heartbeat],
+def _claude_intervals(
+    session_file: Path,
+    since: float,
+    now: float,
+    active_grace_seconds: int,
+    privacy_key: bytes,
+) -> ParseResult:
+    result = ParseResult()
+    fallback_session_id = session_file.stem
+    current: Optional[tuple[str, str, float, str]] = None
+    latest_event = 0.0
+
+    try:
+        handle = session_file.open("r", encoding="utf-8")
+    except OSError:
+        result.inaccessible = True
+        return result
+
+    def close_current(end: float) -> None:
+        nonlocal current
+        if current is None:
+            return
+        session_id, turn_id, start, project_seed = current
+        current = None
+        if end >= since and end >= start:
+            result.intervals.append(
+                _make_interval(
+                    "claude",
+                    session_id,
+                    turn_id,
+                    start,
+                    end,
+                    project_seed,
+                    privacy_key,
+                )
+            )
+
+    with handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                result.malformed_lines += 1
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_time = _parse_iso_timestamp(event.get("timestamp"))
+            if event_time is None:
+                continue
+            timestamp = event_time.timestamp()
+            latest_event = max(latest_event, timestamp)
+
+            if _is_claude_prompt(event):
+                close_current(timestamp)
+                session_id = str(event.get("sessionId") or fallback_session_id)
+                turn_id = str(event.get("promptId") or event.get("uuid") or f"prompt-{timestamp:.6f}")
+                current = (
+                    session_id,
+                    turn_id,
+                    timestamp,
+                    _project_seed(event.get("cwd")),
+                )
+                continue
+
+            message = event.get("message") or {}
+            assistant_end = (
+                event.get("type") == "assistant"
+                and isinstance(message, dict)
+                and message.get("stop_reason") in {"end_turn", "stop_sequence"}
+            )
+            duration_end = event.get("type") == "system" and event.get("subtype") == "turn_duration"
+            if assistant_end or duration_end:
+                close_current(timestamp)
+
+    if current is not None and latest_event:
+        close_current(min(now, latest_event + active_grace_seconds))
+    return result
+
+
+def _timeline_heartbeats(
+    intervals: Sequence[ActivityInterval],
+    since: float,
+    now: float,
+    cadence_seconds: int,
+    privacy_key: bytes,
+) -> list[ActivityHeartbeat]:
+    relevant = [
+        interval
+        for interval in intervals
+        if interval.end >= since and interval.start <= now and interval.end > interval.start
+    ]
+    boundaries = {since, now}
+    for interval in relevant:
+        boundaries.add(max(since, interval.start))
+        boundaries.add(min(now, interval.end))
+    ordered_boundaries = sorted(boundaries)
+
+    segments: list[tuple[float, float, ActivityInterval]] = []
+    for start, end in zip(ordered_boundaries, ordered_boundaries[1:]):
+        if end <= start:
+            continue
+        active = [
+            interval
+            for interval in relevant
+            if interval.start <= start and interval.end >= end
+        ]
+        if not active:
+            continue
+        foreground = max(
+            active,
+            key=lambda interval: (
+                interval.start,
+                interval.engine,
+                interval.session_key,
+                interval.turn_key,
+            ),
+        )
+        if segments and segments[-1][1] == start and segments[-1][2] == foreground:
+            previous_start, _, previous_interval = segments[-1]
+            segments[-1] = (previous_start, end, previous_interval)
+        else:
+            segments.append((start, end, foreground))
+
+    heartbeats: list[ActivityHeartbeat] = []
+    for index, (start, end, foreground) in enumerate(segments):
+        if start == since and foreground.start < since:
+            elapsed = since - foreground.start
+            steps = int(elapsed // cadence_seconds)
+            point = foreground.start + steps * cadence_seconds
+            if point < since:
+                point += cadence_seconds
+        else:
+            point = start
+        points: list[float] = []
+        while point < end:
+            points.append(point)
+            point += cadence_seconds
+        next_start = segments[index + 1][0] if index + 1 < len(segments) else None
+        if next_start is None or next_start > end:
+            points.append(end)
+
+        for heartbeat_time in points:
+            fingerprint_seed = (
+                f"heartbeat:{foreground.engine}:{foreground.session_key}:"
+                f"{foreground.turn_key}:{heartbeat_time:.6f}"
+            )
+            heartbeats.append(
+                ActivityHeartbeat(
+                    fingerprint=_private_hash(fingerprint_seed, privacy_key, 32),
+                    timestamp=heartbeat_time,
+                    engine=foreground.engine,
+                    project=f"project-{foreground.project_key}",
+                    session_key=foreground.session_key,
+                )
+            )
+    return heartbeats
+
+
+def collect_heartbeats(
+    sources: Sequence[Source],
+    since: datetime.datetime,
+    now: datetime.datetime,
+    privacy_key: bytes,
+    cadence_seconds: int = 120,
+    active_grace_seconds: int = 900,
+) -> tuple[list[ActivityHeartbeat], CollectionStats]:
+    """Collect a single privacy-safe activity timeline from transcript roots."""
+    if cadence_seconds <= 0 or active_grace_seconds <= 0:
+        raise ValueError("cadence and active grace must be positive")
+    if len(privacy_key) < 16:
+        raise ValueError("privacy key is too short")
+
+    since_epoch = since.timestamp()
+    now_epoch = now.timestamp()
+    stats = CollectionStats()
+    intervals: list[ActivityInterval] = []
+    for source in sources:
+        if not source.directory.is_dir():
+            continue
+        try:
+            session_files = list(source.directory.rglob("*.jsonl"))
+        except OSError:
+            stats.inaccessible_files += 1
+            continue
+        for session_file in session_files:
+            try:
+                modified_at = session_file.stat().st_mtime
+            except OSError:
+                stats.inaccessible_files += 1
+                continue
+            if modified_at < since_epoch - active_grace_seconds:
+                continue
+            stats.files += 1
+            parser = _codex_intervals if source.engine == "codex" else _claude_intervals
+            parsed = parser(
+                session_file,
+                since_epoch,
+                now_epoch,
+                active_grace_seconds,
+                privacy_key,
+            )
+            stats.malformed_lines += parsed.malformed_lines
+            stats.inaccessible_files += int(parsed.inaccessible)
+            intervals.extend(parsed.intervals)
+
+    unique_intervals: list[ActivityInterval] = []
+    seen: set[tuple[Any, ...]] = set()
+    for interval in sorted(
+        intervals,
+        key=lambda item: (item.start, item.end, item.engine, item.session_key, item.turn_key),
+    ):
+        identity = (
+            interval.engine,
+            interval.session_key,
+            interval.turn_key,
+            interval.start,
+            interval.end,
+        )
+        if identity in seen:
+            stats.duplicate_intervals += 1
+            continue
+        seen.add(identity)
+        unique_intervals.append(interval)
+
+    stats.intervals = len(unique_intervals)
+    return (
+        _timeline_heartbeats(
+            unique_intervals,
+            since_epoch,
+            now_epoch,
+            cadence_seconds,
+            privacy_key,
+        ),
+        stats,
+    )
+
+
+def _parse_source_spec(spec: str) -> tuple[str, str]:
+    separator = "=" if "=" in spec else ":"
+    if separator not in spec:
+        raise ValueError("source must use ENGINE:DIR or ENGINE=DIR")
+    engine, pattern = spec.split(separator, 1)
+    engine = engine.strip().lower()
+    pattern = pattern.strip()
+    if engine not in SUPPORTED_ENGINES or not pattern:
+        raise ValueError("invalid source specification")
+    return engine, pattern
+
+
+def load_sources(
+    source_specs: Sequence[str],
+    source_file: Optional[Path] = None,
+) -> list[Source]:
+    """Load source specs, expand directory globs, and remove duplicate roots."""
+    specs: list[str] = []
+    if source_file and source_file.exists():
+        try:
+            lines = source_file.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise ValueError("unable to read source configuration") from exc
+        for line_number, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                _parse_source_spec(line)
+            except ValueError as exc:
+                raise ValueError(f"invalid source configuration at line {line_number}") from exc
+            specs.append(line)
+    specs.extend(source_specs)
+    if not specs:
+        specs = [
+            f"codex:{Path.home() / '.codex' / 'sessions'}",
+            f"claude:{Path.home() / '.claude' / 'projects'}",
+        ]
+
+    sources: dict[tuple[str, Path], Source] = {}
+    for spec in specs:
+        engine, raw_pattern = _parse_source_spec(spec)
+        expanded_pattern = os.path.expandvars(os.path.expanduser(raw_pattern))
+        matches = glob.glob(expanded_pattern)
+        for match in matches:
+            directory = Path(match)
+            if directory.is_dir():
+                resolved = directory.resolve()
+                sources[(engine, resolved)] = Source(engine, resolved)
+    return sorted(sources.values(), key=lambda source: (source.engine, str(source.directory)))
+
+
+def load_or_create_privacy_key(path: Path) -> bytes:
+    """Load a local random key, creating it with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    try:
+        key = path.read_bytes()
+    except FileNotFoundError:
+        key = secrets.token_bytes(32)
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            key = path.read_bytes()
+        else:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(key)
+    except OSError as exc:
+        raise ValueError("unable to read privacy key") from exc
+    if len(key) < 32:
+        raise ValueError("privacy key must contain at least 32 bytes")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return key
+
+
+class StateDB:
+    """Privacy-safe delivery receipts keyed by opaque heartbeat fingerprints."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            db_path.parent.chmod(0o700)
+        except OSError:
+            pass
+        self.conn = sqlite3.connect(db_path)
+        self._init_schema()
+        try:
+            db_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def _init_schema(self) -> None:
+        self.conn.execute("PRAGMA secure_delete=ON")
+        self.conn.execute("PRAGMA journal_mode=DELETE")
+        tables = {
+            row[0]
+            for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        scrubbed = False
+        if "sent_events" in tables:
+            self.conn.execute("DROP TABLE sent_events")
+            scrubbed = True
+        if "sent_heartbeats" in tables:
+            columns = {
+                row[1] for row in self.conn.execute("PRAGMA table_info(sent_heartbeats)")
+            }
+            expected = {"fingerprint", "timestamp", "sent_at", "mode"}
+            if columns != expected:
+                self.conn.execute("DROP TABLE sent_heartbeats")
+                scrubbed = True
+        self.conn.commit()
+        if scrubbed:
+            self.conn.execute("VACUUM")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_heartbeats (
+                fingerprint TEXT PRIMARY KEY,
+                timestamp REAL NOT NULL,
+                sent_at TEXT NOT NULL,
+                mode TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.commit()
+
+    def is_sent(self, fingerprint: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sent_heartbeats WHERE fingerprint = ? LIMIT 1",
+            (fingerprint,),
+        ).fetchone()
+        return row is not None
+
+    def mark_sent(self, heartbeats: Sequence[ActivityHeartbeat], mode: str) -> None:
+        sent_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self.conn.executemany(
+            """
+            INSERT OR IGNORE INTO sent_heartbeats (fingerprint, timestamp, sent_at, mode)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (heartbeat.fingerprint, heartbeat.timestamp, sent_at, mode)
+                for heartbeat in heartbeats
+            ],
+        )
+        self.conn.commit()
+
+    def prune(self, before: float) -> None:
+        self.conn.execute("DELETE FROM sent_heartbeats WHERE timestamp < ?", (before,))
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def heartbeat_payload(heartbeat: ActivityHeartbeat) -> dict[str, Any]:
+    """Build the complete allowlisted WakaTime payload for one heartbeat."""
+    return {
+        "entity": f"agent:{heartbeat.engine}",
+        "type": "app",
+        "category": "ai coding",
+        "time": heartbeat.timestamp,
+        "project": heartbeat.project,
+        "plugin": PLUGIN,
+        "ai_session": heartbeat.session_key,
+    }
+
+
+def read_wakatime_api_key(config_path: Path) -> str:
+    parser = configparser.RawConfigParser()
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            parser.read_file(handle)
+        key = parser.get("settings", "api_key")
+    except (OSError, configparser.Error) as exc:
+        raise ValueError("unable to read WakaTime configuration") from exc
+    key = key.strip()
+    if not key:
+        raise ValueError("WakaTime API key is missing")
+    return key
+
+
+def make_api_sender(
     api_key: str,
     api_url: str,
-    dry_run: bool,
-    logger: logging.Logger
-) -> Tuple[int, int]:
-    """Send batch of heartbeats via WakaTime API.
+    logger: logging.Logger,
+) -> Callable[[Sequence[ActivityHeartbeat]], bool]:
+    if not api_url.startswith("https://"):
+        raise ValueError("WakaTime API URL must use HTTPS")
+    endpoint = f"{api_url.rstrip('/')}/users/current/heartbeats.bulk"
+    authorization = base64.b64encode(f"{api_key}:".encode("utf-8")).decode("ascii")
 
-    Returns (success_count, failure_count).
-    Implements exponential backoff on 429/5xx errors.
-    """
-    if dry_run:
-        for hb in heartbeats:
-            logger.info(f"[DRY-RUN] Would send via API: {hb.entity} @ {hb.timestamp}")
-        return len(heartbeats), 0
-
-    # Build payload
-    payload = {
-        'heartbeats': [
-            {
-                'entity': hb.entity,
-                'type': hb.entity_type,
-                'category': hb.category,
-                'time': hb.timestamp,
-                'project': hb.project,
-                'plugin': 'codex-bridge/0.1',
-                'metadata': json.dumps(hb.metadata)
-            }
-            for hb in heartbeats
-        ]
-    }
-
-    # Prepare request
-    url = f"{api_url.rstrip('/')}/api/v1/users/current/heartbeats.bulk"
-    auth_str = base64.b64encode(f"{api_key}:".encode()).decode()
-    headers = {
-        'Authorization': f'Basic {auth_str}',
-        'Content-Type': 'application/json'
-    }
-    data = json.dumps(payload).encode('utf-8')
-
-    # Exponential backoff retry
-    max_retries = 5
-    backoff = 1.0
-
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-            with urllib.request.urlopen(req, timeout=30) as response:
-                if response.status == 201 or response.status == 202:
-                    logger.debug(f"API batch sent: {len(heartbeats)} heartbeats")
-                    return len(heartbeats), 0
-                else:
-                    logger.warning(f"API unexpected status {response.status}")
-                    return 0, len(heartbeats)
-
-        except urllib.error.HTTPError as e:
-            if e.code == 429 or e.code >= 500:
-                logger.warning(
-                    f"API HTTP {e.code} (attempt {attempt + 1}/{max_retries}), "
-                    f"retrying in {backoff}s..."
-                )
-                if attempt < max_retries - 1:
+    def send(heartbeats: Sequence[ActivityHeartbeat]) -> bool:
+        data = json.dumps([heartbeat_payload(item) for item in heartbeats]).encode("utf-8")
+        headers = {
+            "Authorization": f"Basic {authorization}",
+            "Content-Type": "application/json",
+            "User-Agent": PLUGIN,
+        }
+        backoff = 1.0
+        for attempt in range(5):
+            request = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    if response.status in {200, 201, 202}:
+                        return True
+                    logger.warning("WakaTime returned an unexpected status")
+                    return False
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code == 429 or exc.code >= 500
+                if retryable and attempt < 4:
+                    logger.warning("WakaTime request will be retried after HTTP %d", exc.code)
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 30)
                     continue
+                logger.error("WakaTime rejected a heartbeat batch with HTTP %d", exc.code)
+                return False
+            except (urllib.error.URLError, TimeoutError, OSError):
+                if attempt < 4:
+                    logger.warning("WakaTime network request will be retried")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                    continue
+                logger.error("WakaTime network request failed")
+                return False
+        return False
 
-            logger.error(f"API HTTP error {e.code}: {e.reason}")
-            return 0, len(heartbeats)
-
-        except urllib.error.URLError as e:
-            logger.error(f"API URL error: {e.reason}")
-            return 0, len(heartbeats)
-
-        except Exception as e:
-            logger.error(f"API error: {e}")
-            return 0, len(heartbeats)
-
-    logger.error(f"API failed after {max_retries} retries")
-    return 0, len(heartbeats)
-
-
-# ============================================================================
-# Main Sync Logic
-# ============================================================================
+    return send
 
 
-def sync(
-    sessions_dir: Path,
-    state_db: StateDB,
+def sync_activity(
+    sources: Sequence[Source],
+    state: StateDB,
     since: datetime.datetime,
-    mode: str,
-    dry_run: bool,
-    batch_size: int,
-    wakatime_bin: str,
-    api_key: Optional[str],
-    api_url: str,
-    project: Optional[str],
-    max_events: Optional[int],
-    logger: logging.Logger
-) -> Stats:
-    """Main sync pipeline: scan → parse → normalize → dedupe → send."""
-    stats = Stats()
+    now: datetime.datetime,
+    privacy_key: bytes,
+    sender: Callable[[Sequence[ActivityHeartbeat]], bool],
+    logger: logging.Logger,
+    batch_size: int = 25,
+    cadence_seconds: int = 120,
+    active_grace_seconds: int = 900,
+    dry_run: bool = False,
+) -> SyncStats:
+    if batch_size < 1 or batch_size > 25:
+        raise ValueError("batch size must be between 1 and 25")
+    heartbeats, collected = collect_heartbeats(
+        sources,
+        since,
+        now,
+        privacy_key,
+        cadence_seconds,
+        active_grace_seconds,
+    )
+    pending = [heartbeat for heartbeat in heartbeats if not state.is_sent(heartbeat.fingerprint)]
+    stats = SyncStats(
+        files=collected.files,
+        intervals=collected.intervals,
+        generated=len(heartbeats),
+        duplicates=len(heartbeats) - len(pending) + collected.duplicate_intervals,
+        malformed_lines=collected.malformed_lines,
+        inaccessible_files=collected.inaccessible_files,
+    )
+    if dry_run:
+        logger.info(
+            "sync preview: sources=%d files=%d intervals=%d heartbeats=%d pending=%d",
+            len(sources),
+            stats.files,
+            stats.intervals,
+            stats.generated,
+            len(pending),
+        )
+        return stats
 
-    # 1. Scan and parse
-    logger.info(f"Scanning sessions from {sessions_dir} since {since.isoformat()}")
-    events = parse_codex_logs(sessions_dir, since, max_events, logger)
-    stats.scanned = len(events)
-    logger.info(f"Scanned {stats.scanned} events")
-
-    # 2. Normalize to heartbeats
-    heartbeats = normalize_to_heartbeats(events, project, logger)
-    stats.eligible = len(heartbeats)
-    logger.info(f"Normalized {stats.eligible} eligible heartbeats")
-
-    # 3. Deduplicate
-    unique_heartbeats = []
-    for hb in heartbeats:
-        if state_db.is_sent(hb.call_id):
-            stats.duplicates += 1
+    for offset in range(0, len(pending), batch_size):
+        batch = pending[offset : offset + batch_size]
+        if sender(batch):
+            state.mark_sent(batch, "api")
+            stats.sent += len(batch)
         else:
-            unique_heartbeats.append(hb)
-
-    logger.info(f"Filtered out {stats.duplicates} duplicates, {len(unique_heartbeats)} remain")
-
-    # 4. Send
-    if mode == 'cli':
-        for hb in unique_heartbeats:
-            success = send_cli_mode(hb, wakatime_bin, dry_run, logger)
-            if success:
-                if not dry_run:
-                    state_db.mark_sent(hb, mode)
-                stats.sent += 1
-            else:
-                stats.failed += 1
-
-    elif mode == 'api':
-        # Send in batches
-        for i in range(0, len(unique_heartbeats), batch_size):
-            batch = unique_heartbeats[i:i + batch_size]
-            sent, failed = send_api_mode_batch(batch, api_key, api_url, dry_run, logger)
-
-            if not dry_run:
-                # Mark successfully sent heartbeats
-                for hb in batch[:sent]:
-                    state_db.mark_sent(hb, mode)
-
-            stats.sent += sent
-            stats.failed += failed
-
+            stats.failed += len(batch)
+    logger.info(
+        "sync complete: sources=%d files=%d intervals=%d generated=%d duplicates=%d sent=%d failed=%d malformed=%d inaccessible=%d",
+        len(sources),
+        stats.files,
+        stats.intervals,
+        stats.generated,
+        stats.duplicates,
+        stats.sent,
+        stats.failed,
+        stats.malformed_lines,
+        stats.inaccessible_files,
+    )
     return stats
 
 
-# ============================================================================
-# CLI Entry Point
-# ============================================================================
-
-
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Sync Codex shell activity to WakaTime heartbeats',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Sync privacy-safe Codex and Claude activity to WakaTime"
     )
-
-    subparsers = parser.add_subparsers(dest='command', required=True)
-
-    sync_parser = subparsers.add_parser('sync', help='Sync Codex logs to WakaTime')
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    sync_parser = subparsers.add_parser("sync", help="scan configured transcript roots")
+    sync_parser.add_argument("--since", default="45m")
     sync_parser.add_argument(
-        '--since',
-        default='2h',
-        help='Process events since this time (15m, 2h, 1d, ISO date, ISO datetime). Default: 2h'
+        "--source",
+        action="append",
+        default=[],
+        metavar="ENGINE:DIR",
+        help="add a Codex or Claude transcript root; directory globs are accepted",
     )
+    sync_parser.add_argument("--source-file", type=Path)
     sync_parser.add_argument(
-        '--sessions-dir',
+        "--sessions-dir",
         type=Path,
-        default=Path.home() / '.codex' / 'sessions',
-        help='Path to Codex sessions directory. Default: ~/.codex/sessions'
+        action="append",
+        default=[],
+        help=argparse.SUPPRESS,
     )
+    sync_parser.add_argument("--state-db", type=Path, default=DEFAULT_STATE_DB)
+    sync_parser.add_argument("--privacy-key-file", type=Path, default=DEFAULT_PRIVACY_KEY)
+    sync_parser.add_argument("--wakatime-config", type=Path, default=DEFAULT_WAKATIME_CONFIG)
     sync_parser.add_argument(
-        '--state-db',
-        type=Path,
-        default=Path.home() / '.codex-wakatime' / 'state.db',
-        help='Path to state database. Default: ~/.codex-wakatime/state.db'
+        "--api-url",
+        default="https://api.wakatime.com/api/v1",
     )
+    sync_parser.add_argument("--batch-size", type=int, default=25)
+    sync_parser.add_argument("--cadence-seconds", type=int, default=120)
+    sync_parser.add_argument("--active-grace", default="15m")
+    sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument(
-        '--mode',
-        choices=['cli', 'api'],
-        default='cli',
-        help='Send mode: cli (wakatime-cli) or api (HTTP API). Default: cli'
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
     )
-    sync_parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='Log heartbeats without sending or recording to DB'
-    )
-    sync_parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=25,
-        help='Batch size for API mode. Default: 25'
-    )
-    sync_parser.add_argument(
-        '--wakatime-bin',
-        default='wakatime-cli',
-        help='Path to wakatime-cli binary. Default: wakatime-cli'
-    )
-    sync_parser.add_argument(
-        '--api-key',
-        help='WakaTime API key (for API mode). Can also use WAKATIME_API_KEY env var'
-    )
-    sync_parser.add_argument(
-        '--api-url',
-        default='https://api.wakatime.com',
-        help='WakaTime API base URL. Default: https://api.wakatime.com'
-    )
-    sync_parser.add_argument(
-        '--project',
-        help='Override project name (default: derive from workdir/cwd)'
-    )
-    sync_parser.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        default='INFO',
-        help='Logging level. Default: INFO'
-    )
-    sync_parser.add_argument(
-        '--max-events',
-        type=int,
-        help='Maximum events to process (for testing)'
-    )
+    return parser
 
-    args = parser.parse_args()
 
-    # Setup logging
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level),
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("agent-wakatime")
+    now = datetime.datetime.now(datetime.timezone.utc)
 
-    if args.command == 'sync':
-        # Parse since
+    try:
+        since = parse_since(args.since, now)
+        active_grace = parse_duration(args.active_grace)
+        source_specs = list(args.source)
+        source_specs.extend(f"codex:{directory}" for directory in args.sessions_dir)
+        source_file = args.source_file
+        if source_file is None and DEFAULT_SOURCE_FILE.exists():
+            source_file = DEFAULT_SOURCE_FILE
+        sources = load_sources(source_specs, source_file)
+        if not sources:
+            raise ValueError("no readable transcript source directories were found")
+        privacy_key = load_or_create_privacy_key(args.privacy_key_file)
+        state = StateDB(args.state_db)
         try:
-            since = parse_since(args.since)
-        except ValueError as e:
-            logger.error(str(e))
-            sys.exit(1)
-
-        # Validate sessions directory
-        if not args.sessions_dir.exists():
-            logger.error(f"Sessions directory not found: {args.sessions_dir}")
-            sys.exit(1)
-
-        # Get API key from env if not provided
-        api_key = args.api_key or os.environ.get('WAKATIME_API_KEY')
-        if args.mode == 'api' and not api_key:
-            logger.error("API mode requires --api-key or WAKATIME_API_KEY env var")
-            sys.exit(1)
-
-        # Open state database
-        state_db = StateDB(args.state_db)
-
-        try:
-            stats = sync(
-                sessions_dir=args.sessions_dir,
-                state_db=state_db,
-                since=since,
-                mode=args.mode,
-                dry_run=args.dry_run,
+            if args.dry_run:
+                sender: Callable[[Sequence[ActivityHeartbeat]], bool] = lambda _batch: True
+            else:
+                api_key = read_wakatime_api_key(args.wakatime_config)
+                sender = make_api_sender(api_key, args.api_url, logger)
+            stats = sync_activity(
+                sources,
+                state,
+                since,
+                now,
+                privacy_key,
+                sender,
+                logger,
                 batch_size=args.batch_size,
-                wakatime_bin=args.wakatime_bin,
-                api_key=api_key,
-                api_url=args.api_url,
-                project=args.project,
-                max_events=args.max_events,
-                logger=logger
+                cadence_seconds=args.cadence_seconds,
+                active_grace_seconds=active_grace,
+                dry_run=args.dry_run,
             )
-
-            # Print summary
-            logger.info("=" * 60)
-            logger.info("SYNC SUMMARY")
-            logger.info("=" * 60)
-            logger.info(f"Scanned events:      {stats.scanned}")
-            logger.info(f"Eligible heartbeats: {stats.eligible}")
-            logger.info(f"Duplicates skipped:  {stats.duplicates}")
-            logger.info(f"Successfully sent:   {stats.sent}")
-            logger.info(f"Failed:              {stats.failed}")
-            logger.info("=" * 60)
-
-            # Exit with error if any failures
-            if stats.failed > 0 and not args.dry_run:
-                sys.exit(1)
-
+            state.prune((now - datetime.timedelta(days=90)).timestamp())
         finally:
-            state_db.close()
+            state.close()
+    except ValueError as exc:
+        logger.error("sync configuration failed: %s", exc)
+        return 2
+    except (OSError, sqlite3.Error):
+        logger.error("sync configuration failed during local storage access")
+        return 2
+    except Exception:
+        logger.error("sync failed with an internal error")
+        return 1
+    return 1 if stats.failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

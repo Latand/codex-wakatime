@@ -9,9 +9,10 @@ if [[ ! -f "${DEFAULT_SYNC_SCRIPT}" ]]; then
   DEFAULT_SYNC_SCRIPT="${SCRIPT_DIR}/../codex_wakatime_sync.py"
 fi
 SYNC_SCRIPT="${SCRIPT_PATH:-${DEFAULT_SYNC_SCRIPT}}"
-SESSIONS_DIR="${SESSIONS_DIR:-$HOME/.codex/sessions}"
 STATE_DB="${STATE_DB:-$HOME/.codex-wakatime/state.db}"
-WAKATIME_BIN="${WAKATIME_BIN:-wakatime-cli}"
+PRIVACY_KEY_FILE="${PRIVACY_KEY_FILE:-$HOME/.codex-wakatime/privacy.key}"
+WAKATIME_CONFIG="${WAKATIME_CONFIG:-$HOME/.wakatime.cfg}"
+SOURCE_FILE="${SOURCE_FILE-$HOME/.config/agent-wakatime/sources.conf}"
 
 SINCE_ARG="${SINCE:-}"
 EXTRA_ARGS=("$@")
@@ -21,11 +22,15 @@ if [[ $# -gt 0 && ${1} != --* ]]; then
 fi
 SINCE_ARG="${SINCE_ARG:-45m}"
 
-${PYTHON_BIN} "${SYNC_SCRIPT}" sync \
-  --since "${SINCE_ARG}" \
-  --sessions-dir "${SESSIONS_DIR}" \
-  --state-db "${STATE_DB}" \
-  --wakatime-bin "${WAKATIME_BIN}" \
-  "${EXTRA_ARGS[@]}"
+SOURCE_ARGS=()
+if [[ -n "${SOURCE_FILE}" && -f "${SOURCE_FILE}" ]]; then
+  SOURCE_ARGS=(--source-file "${SOURCE_FILE}")
+fi
 
-"${WAKATIME_BIN}" --sync-offline-activity 0 >/dev/null 2>&1 || true
+exec "${PYTHON_BIN}" "${SYNC_SCRIPT}" sync \
+  --since "${SINCE_ARG}" \
+  --state-db "${STATE_DB}" \
+  --privacy-key-file "${PRIVACY_KEY_FILE}" \
+  --wakatime-config "${WAKATIME_CONFIG}" \
+  "${SOURCE_ARGS[@]}" \
+  "${EXTRA_ARGS[@]}"
